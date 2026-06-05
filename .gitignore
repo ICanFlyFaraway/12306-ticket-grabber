@@ -1,0 +1,28 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 本地数据与密钥（勿上传）
+data/ticket_grabber.db
+data/.key
+data/trips.ics
+data/stations_full.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 打包产物
+*.spec.bak
+
+# 环境变量
+.env
+.env.*

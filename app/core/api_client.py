@@ -1,0 +1,363 @@
+from __future__ import annotations
+
+import json
+import random
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from typing import Any
+
+import requests
+
+from app.config import DEFAULT_HEADERS, KYFW_BASE, PASSPORT_BASE, USE_MOCK
+from app.core.proxy_pool import ProxyPool
+from app.core.station_registry import resolve_station_code as lookup_station_code
+
+
+@dataclass
+class TrainTicket:
+    train_code: str
+    from_station: str
+    to_station: str
+    from_station_name: str
+    to_station_name: str
+    start_time: str
+    arrive_time: str
+    duration: str
+    can_web_buy: str
+    secret_str: str
+    travel_date: str = ""
+    seats: dict[str, str] = field(default_factory=dict)
+
+
+class ApiClient:
+    """12306 HTTP 客户端，支持代理与 Mock 模式。"""
+
+    def __init__(self, proxy_pool: ProxyPool | None = None) -> None:
+        self.proxy_pool = proxy_pool or ProxyPool()
+        self.session = requests.Session()
+        self.session.headers.update(DEFAULT_HEADERS)
+        self._cookies: dict[str, str] = {}
+        self.logged_in = False
+        self.username = ""
+        self._query_path: str | None = None
+        self._station_cache: dict[str, str] = {}
+
+    def _proxies(self) -> dict[str, str] | None:
+        proxy = self.proxy_pool.get_proxy()
+        if not proxy:
+            return None
+        return {"http": proxy, "https": proxy}
+
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", 15)
+        kwargs.setdefault("proxies", self._proxies())
+        return self.session.get(url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", 15)
+        kwargs.setdefault("proxies", self._proxies())
+        return self.session.post(url, **kwargs)
+
+    def init_session(self, force_real: bool = False) -> None:
+        if USE_MOCK and not force_real:
+            self._cookies["mock_session"] = "1"
+            return
+        resp = self.get(f"{KYFW_BASE}/otn/leftTicket/init")
+        self._query_path = self._parse_query_path(resp.text)
+        self.get(f"{PASSPORT_BASE}/passport/web/login")
+
+    def resolve_station_code(self, name: str, local_map: dict[str, str] | None = None) -> str:
+        """将站名解析为电报码，使用本地 + 12306 全量站名表。"""
+        name = name.strip()
+        if not name:
+            raise ValueError("站名不能为空")
+        if name in self._station_cache:
+            return self._station_cache[name]
+        code = lookup_station_code(name, local_map)
+        self._station_cache[name] = code
+        return code
+
+    def _parse_query_path(self, html: str) -> str:
+        patterns = [
+            r"['\"](/otn/leftTicket/query[A-Z]?)['\"]",
+            r"CLeftTicketUrl\s*=\s*['\"]([^'\"]+)['\"]",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html)
+            if match:
+                path = match.group(1)
+                if not path.startswith("/"):
+                    path = f"/otn/{path.lstrip('/')}"
+                if "leftTicket" in path:
+                    return path.split("?")[0]
+        return "/otn/leftTicket/queryG"
+
+    def _ensure_query_path(self) -> str:
+        if self._query_path:
+            return self._query_path
+        if USE_MOCK:
+            self.init_session(force_real=True)
+        else:
+            resp = self.get(f"{KYFW_BASE}/otn/leftTicket/init")
+            self._query_path = self._parse_query_path(resp.text)
+        return self._query_path or "/otn/leftTicket/queryG"
+
+    def _validate_travel_date(self, travel_date: str) -> None:
+        try:
+            target = datetime.strptime(travel_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError(f"日期格式无效: {travel_date}") from exc
+        today = date.today()
+        if target < today:
+            raise ValueError(f"日期 {travel_date} 已过期，请选择今天及之后的日期")
+        if target > today + timedelta(days=15):
+            raise ValueError(
+                f"日期 {travel_date} 超出预售期（12306 通常仅预售 15 天内车票）"
+            )
+
+    def _parse_query_json(self, resp: requests.Response, travel_date: str) -> dict[str, Any]:
+        content_type = (resp.headers.get("content-type") or "").lower()
+        text = resp.text.strip()
+        if not text:
+            raise RuntimeError(f"日期 {travel_date} 查询无响应，请稍后重试")
+        if "json" not in content_type:
+            raise RuntimeError(
+                f"日期 {travel_date} 无法查询（可能已过期或超出预售期），请检查日期"
+            )
+        try:
+            return resp.json()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"日期 {travel_date} 响应异常，请确认日期在预售期内并重试"
+            ) from exc
+
+    def query_tickets(
+        self,
+        from_code: str,
+        to_code: str,
+        travel_date: str,
+        force_real: bool = False,
+    ) -> list[TrainTicket]:
+        if USE_MOCK and not force_real:
+            return self._mock_tickets(from_code, to_code, travel_date)
+
+        self._validate_travel_date(travel_date)
+
+        paths = [self._ensure_query_path(), "/otn/leftTicket/queryG", "/otn/leftTicket/queryZ"]
+        seen: set[str] = set()
+        paths = [p for p in paths if not (p in seen or seen.add(p))]
+
+        params = {
+            "leftTicketDTO.train_date": travel_date,
+            "leftTicketDTO.from_station": from_code,
+            "leftTicketDTO.to_station": to_code,
+            "purpose_codes": "ADULT",
+        }
+        last_error: Exception | None = None
+        for path in paths:
+            try:
+                resp = self.get(f"{KYFW_BASE}{path}", params=params)
+                resp.raise_for_status()
+                data = self._parse_query_json(resp, travel_date)
+                if data.get("status") is not True:
+                    msgs = data.get("messages") or data.get("message") or ["查票失败"]
+                    raise RuntimeError(msgs[0] if isinstance(msgs, list) else str(msgs))
+                self._query_path = path
+                result: list[TrainTicket] = []
+                station_map = data.get("data", {}).get("map", {})
+                for row in data.get("data", {}).get("result", []):
+                    ticket = self._parse_ticket_row(row, station_map, travel_date)
+                    if ticket:
+                        result.append(ticket)
+                return result
+            except Exception as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(f"查票失败: {last_error}")
+
+    def query_tickets_multi_dates(
+        self,
+        from_code: str,
+        to_code: str,
+        travel_dates: list[str],
+        force_real: bool = True,
+    ) -> tuple[list[TrainTicket], list[str]]:
+        all_tickets: list[TrainTicket] = []
+        warnings: list[str] = []
+        for travel_date in travel_dates:
+            try:
+                tickets = self.query_tickets(
+                    from_code, to_code, travel_date, force_real=force_real
+                )
+                all_tickets.extend(tickets)
+            except Exception as exc:
+                warnings.append(str(exc))
+        if not all_tickets and warnings:
+            raise RuntimeError("\n".join(warnings))
+        return all_tickets, warnings
+
+    def _parse_ticket_row(
+        self, row: str, station_map: dict, travel_date: str = ""
+    ) -> TrainTicket | None:
+        parts = row.split("|")
+        if len(parts) < 35:
+            return None
+        from_code = parts[6]
+        to_code = parts[7]
+        return TrainTicket(
+            train_code=parts[3],
+            from_station=from_code,
+            to_station=to_code,
+            from_station_name=station_map.get(from_code, from_code),
+            to_station_name=station_map.get(to_code, to_code),
+            start_time=parts[8],
+            arrive_time=parts[9],
+            duration=parts[10],
+            can_web_buy=parts[11],
+            secret_str=parts[0] if parts[0] else parts[2],
+            travel_date=travel_date,
+            seats={
+                "商务座": parts[32] or "--",
+                "一等座": parts[31] or "--",
+                "二等座": parts[30] or "--",
+                "高级软卧": parts[21] or "--",
+                "软卧": parts[23] or "--",
+                "硬卧": parts[28] or "--",
+                "软座": parts[24] or "--",
+                "硬座": parts[29] or "--",
+                "无座": parts[26] or "--",
+            },
+        )
+
+    def _mock_tickets(
+        self, from_code: str, to_code: str, travel_date: str
+    ) -> list[TrainTicket]:
+        trains = [
+            ("G101", "06:30", "11:45", "5:15"),
+            ("G103", "07:00", "12:10", "5:10"),
+            ("D321", "08:15", "14:20", "6:05"),
+            ("K571", "20:30", "08:15", "11:45"),
+        ]
+        result = []
+        for code, start, arrive, duration in trains:
+            seats = {
+                "商务座": random.choice(["无", "3", "8"]),
+                "一等座": random.choice(["无", "5", "12"]),
+                "二等座": random.choice(["无", "有", "15", "0"]),
+                "硬卧": random.choice(["无", "4", "有"]),
+                "硬座": random.choice(["无", "有", "20"]),
+                "无座": random.choice(["无", "有"]),
+            }
+            result.append(
+                TrainTicket(
+                    train_code=code,
+                    from_station=from_code,
+                    to_station=to_code,
+                    from_station_name="出发",
+                    to_station_name="到达",
+                    start_time=start,
+                    arrive_time=arrive,
+                    duration=duration,
+                    can_web_buy="Y",
+                    secret_str=f"mock_secret_{code}_{travel_date}",
+                    travel_date=travel_date,
+                    seats=seats,
+                )
+            )
+        return result
+
+    def check_user(self) -> bool:
+        if USE_MOCK:
+            return self.logged_in
+        url = f"{KYFW_BASE}/otn/login/checkUser"
+        resp = self.post(url, data={"_json_att": ""})
+        try:
+            data = resp.json()
+            return data.get("data", {}).get("flag") is True
+        except Exception:
+            return False
+
+    def submit_order_request(
+        self, secret_str: str, train_date: str, from_code: str, to_code: str
+    ) -> dict[str, Any]:
+        if USE_MOCK:
+            time.sleep(0.3)
+            if random.random() < 0.85:
+                return {"status": True, "order_id": f"MOCK{int(time.time())}"}
+            return {"status": False, "message": "模拟下单失败，余票已被抢"}
+
+        url = f"{KYFW_BASE}/otn/leftTicket/submitOrderRequest"
+        data = {
+            "secretStr": secret_str,
+            "train_date": train_date,
+            "back_train_date": travel_date_fallback(),
+            "tour_flag": "dc",
+            "purpose_codes": "ADULT",
+            "query_from_station_name": from_code,
+            "query_to_station_name": to_code,
+            "undefined": "",
+        }
+        resp = self.post(url, data=data)
+        return resp.json()
+
+    def confirm_passenger_info(
+        self, passengers: list[dict], seat_type: str, train_code: str
+    ) -> dict[str, Any]:
+        if USE_MOCK:
+            return {"status": True, "ticket_price": "553.5"}
+
+        # 真实环境需多步确认；此处保留接口骨架
+        return {"status": True, "ticket_price": ""}
+
+    def query_order_status(self, order_id: str) -> str:
+        if USE_MOCK:
+            return "wait_pay" if order_id.startswith("MOCK") else "unknown"
+        return "unknown"
+
+    def get_qr_code(self) -> tuple[str, str]:
+        """返回 (uuid, qr_image_base64)。"""
+        if USE_MOCK:
+            return "mock-uuid", ""
+        url = f"{PASSPORT_BASE}/passport/web/create-qr64"
+        resp = self.post(url, data={"appid": "otn"})
+        data = resp.json()
+        return data.get("uuid", ""), data.get("image", "")
+
+    def check_qr_status(self, uuid: str) -> dict[str, Any]:
+        if USE_MOCK:
+            return {"status": False}
+        url = f"{PASSPORT_BASE}/passport/web/checkqr"
+        resp = self.post(url, data={"uuid": uuid, "appid": "otn"})
+        return resp.json()
+
+
+def travel_date_fallback() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def has_ticket(seat_status: str) -> bool:
+    if not seat_status or seat_status in ("--", "无", "*"):
+        return False
+    if seat_status == "有":
+        return True
+    return seat_status.isdigit() and int(seat_status) > 0
+
+
+def format_seat_display(seat_status: str) -> str:
+    """将 12306 席别余票字段转为可读文本。"""
+    if not seat_status or seat_status in ("--", "*"):
+        return "无"
+    if seat_status == "无":
+        return "无"
+    if seat_status == "有":
+        return "有票"
+    if seat_status.isdigit():
+        count = int(seat_status)
+        return "无" if count == 0 else f"{count}张"
+    return seat_status
+
+
+def seat_has_stock_display(seat_status: str) -> bool:
+    return has_ticket(seat_status)
