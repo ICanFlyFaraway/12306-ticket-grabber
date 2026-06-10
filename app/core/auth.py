@@ -34,14 +34,13 @@ class AuthService:
                 return LoginResult(True, "模拟登录成功", username)
             return LoginResult(False, "用户名或密码不能为空")
 
+        self.client.init_session()
         for attempt in range(1, self.max_retries + 1):
             try:
                 captcha_code = self._resolve_captcha(on_captcha)
                 ok, msg = self._do_login(username, password, captcha_code)
                 if ok:
-                    self.client.logged_in = True
-                    self.client.username = username
-                    return LoginResult(True, msg, username)
+                    return LoginResult(True, msg, self.client.username or username)
                 if "验证码" not in msg:
                     return LoginResult(False, msg)
             except Exception as exc:
@@ -57,6 +56,8 @@ class AuthService:
         on_qr: Callable[[str, str], None] | None = None,
         on_status: Callable[[str], None] | None = None,
     ) -> LoginResult:
+        if not USE_MOCK:
+            self.client.init_session()
         uuid, image_b64 = self.client.get_qr_code()
         if on_qr:
             on_qr(uuid, image_b64)
@@ -73,16 +74,30 @@ class AuthService:
             code = data.get("result_code", "")
             if on_status:
                 on_status(str(code))
-            if code == "2":
+            if str(code) == "2":
+                uamtk = data.get("uamtk") or ""
                 self.client.logged_in = True
-                return LoginResult(True, "扫码登录成功")
-            if code in ("3", "4"):
+                ok, err = self.client.complete_login(uamtk=uamtk or None, qr_login=True)
+                if ok:
+                    return LoginResult(True, "扫码登录成功", self.client.username or "扫码用户")
+                self.client.logged_in = False
+                return LoginResult(False, err or "登录令牌换取失败，请重试")
+            if str(code) in ("3", "4"):
                 return LoginResult(False, "二维码已过期或取消")
             time.sleep(poll_interval)
         return LoginResult(False, "扫码超时")
 
     def check_login(self) -> bool:
-        return self.client.check_user() if self.client.logged_in else False
+        if not self.client.logged_in:
+            return False
+        if USE_MOCK:
+            return True
+        if self.client.check_user():
+            return True
+        if self.client.refresh_login_status():
+            return True
+        self.client.logged_in = False
+        return False
 
     def logout(self) -> None:
         self.client.logged_in = False
@@ -116,9 +131,14 @@ class AuthService:
         resp = self.client.post(url, data=data)
         try:
             result = resp.json()
-            if result.get("result_code") == 0:
-                self.client.get("https://kyfw.12306.cn/otn/login/loginAysnSuggest")
-                return True, "登录成功"
+            if str(result.get("result_code", "")) == "0":
+                uamtk = result.get("uamtk") or ""
+                self.client.logged_in = True
+                ok, err = self.client.complete_login(uamtk=uamtk or None, qr_login=False)
+                if ok:
+                    return True, "登录成功"
+                self.client.logged_in = False
+                return False, err or "登录令牌换取失败，请重试"
             return False, result.get("result_message", "登录失败")
         except Exception as exc:
             return False, str(exc)

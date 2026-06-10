@@ -94,9 +94,12 @@ class ConfigPanel(QWidget):
         self._stations = get_station_registry()
         self._query_worker: TrainQueryWorker | None = None
         self._station_refresh_worker: StationRefreshWorker | None = None
+        self._saved_train_codes: list[str] = []
         self._build_ui()
         self._load_passengers()
-        self._add_default_date()
+        self._load_last_config()
+        if not self.get_travel_dates():
+            self._add_default_date()
 
     def _load_stations(self) -> dict[str, str]:
         return get_station_registry()
@@ -447,6 +450,50 @@ class ConfigPanel(QWidget):
                 if p.is_default:
                     item.setSelected(True)
 
+    def _load_last_config(self) -> None:
+        with get_session() as session:
+            tc = (
+                session.query(TaskConfig)
+                .filter_by(name="当前任务", is_active=True)
+                .order_by(TaskConfig.created_at.desc())
+                .first()
+            )
+            if not tc:
+                return
+
+            if tc.from_station_name:
+                self.from_combo.setCurrentText(tc.from_station_name)
+            if tc.to_station_name:
+                self.to_combo.setCurrentText(tc.to_station_name)
+
+            self.date_list.clear()
+            for date_text in tc.travel_date.split(","):
+                date_text = date_text.strip()
+                if date_text:
+                    self.date_list.addItem(date_text)
+
+            for seat, cb in self.seat_checks.items():
+                cb.setChecked(seat in (tc.seat_types or ""))
+
+            self.interval_spin.setValue(float(tc.poll_interval or 3))
+            self.waitlist_cb.setChecked(bool(tc.enable_waitlist))
+            self.auto_submit_cb.setChecked(bool(tc.auto_submit))
+
+            if tc.train_codes:
+                self._saved_train_codes = [
+                    code.strip() for code in tc.train_codes.split(",") if code.strip()
+                ]
+
+            if tc.passenger_ids:
+                selected_ids = {
+                    int(pid)
+                    for pid in tc.passenger_ids.split(",")
+                    if pid.strip().isdigit()
+                }
+                for i in range(self.passenger_list.count()):
+                    item = self.passenger_list.item(i)
+                    item.setSelected(item.data(Qt.ItemDataRole.UserRole) in selected_ids)
+
     def _add_passenger_dialog(self) -> None:
         dlg = QDialog(self)
         dlg.setWindowTitle("添加乘车人")
@@ -508,9 +555,15 @@ class ConfigPanel(QWidget):
             "enable_waitlist": self.waitlist_cb.isChecked(),
             "auto_submit": self.auto_submit_cb.isChecked(),
         }
+        self._saved_train_codes = list(trains)
         with get_session() as session:
-            tc = TaskConfig(**config, name="当前任务")
-            session.add(tc)
+            tc = session.query(TaskConfig).filter_by(name="当前任务").first()
+            if tc:
+                for key, value in config.items():
+                    setattr(tc, key, value)
+                tc.is_active = True
+            else:
+                session.add(TaskConfig(**config, name="当前任务"))
         self.saved.emit(config)
 
     def get_monitor_config(self) -> dict | None:
@@ -522,6 +575,8 @@ class ConfigPanel(QWidget):
         from_code, to_code = self._resolve_codes(from_name, to_name)
         seats = [s for s, cb in self.seat_checks.items() if cb.isChecked()]
         trains = self.get_selected_train_codes()
+        if not trains and self._saved_train_codes:
+            trains = list(self._saved_train_codes)
         selected = [
             self.passenger_list.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self.passenger_list.count())

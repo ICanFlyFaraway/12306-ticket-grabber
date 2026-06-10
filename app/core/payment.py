@@ -25,7 +25,7 @@ class PaymentWatcher:
         self.on_paid = on_paid or (lambda oid: None)
         self._threads: dict[str, threading.Thread] = {}
 
-    def watch(self, order_id: str, auto_pay: bool = False) -> None:
+    def watch(self, order_id: str, auto_pay: bool = False, show_notify: bool = True) -> None:
         if order_id in self._threads:
             return
         t = threading.Thread(
@@ -35,7 +35,8 @@ class PaymentWatcher:
         )
         self._threads[order_id] = t
         t.start()
-        notify("待支付", f"订单 {order_id} 已生成，请在30分钟内完成支付")
+        if show_notify:
+            notify("待支付", f"订单 {order_id} 已生成，请在30分钟内完成支付")
 
     def confirm_paid(self, order_id: str) -> None:
         self.order_service.mark_paid(order_id)

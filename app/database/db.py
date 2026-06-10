@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import DB_PATH
 from app.database.models import Base
 
-_engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+_engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    echo=False,
+    connect_args={"check_same_thread": False},
+)
 SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False)
 
 

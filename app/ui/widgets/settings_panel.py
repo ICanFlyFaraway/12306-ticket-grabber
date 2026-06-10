@@ -17,7 +17,15 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.proxy_pool import ProxyPool
-from app.core.settings_store import SmsConfig, get_sms_config, save_sms_config
+from app.core.settings_store import (
+    SmsConfig,
+    get_auto_pay,
+    get_proxy_text,
+    get_sms_config,
+    save_auto_pay,
+    save_proxy_text,
+    save_sms_config,
+)
 
 
 class SettingsPanel(QWidget):
@@ -25,7 +33,7 @@ class SettingsPanel(QWidget):
         super().__init__(parent)
         self.proxy_pool = proxy_pool
         self._build_ui()
-        self._load_sms_config()
+        self._load_settings()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -94,6 +102,7 @@ class SettingsPanel(QWidget):
         pay_form = QFormLayout(pay_group)
         self.auto_pay_cb = QPushButton("自动支付（实验性）")
         self.auto_pay_cb.setCheckable(True)
+        self.auto_pay_cb.toggled.connect(lambda _: self._save_auto_pay())
         pay_form.addRow("自动支付", self.auto_pay_cb)
         layout.addWidget(pay_group)
 
@@ -152,6 +161,16 @@ class SettingsPanel(QWidget):
     def _on_provider_changed(self) -> None:
         self.provider_stack.setCurrentIndex(self.sms_provider_combo.currentIndex())
 
+    def _load_settings(self) -> None:
+        self._load_sms_config()
+        self.proxy_edit.setPlainText(get_proxy_text())
+        if self.proxy_edit.toPlainText().strip():
+            count = self.proxy_pool.load_from_text(self.proxy_edit.toPlainText())
+            self.proxy_count_label.setText(f"当前可用代理: {self.proxy_pool.count} (已加载 {count})")
+        else:
+            self.proxy_count_label.setText(f"当前可用代理: {self.proxy_pool.count}")
+        self.auto_pay_cb.setChecked(get_auto_pay())
+
     def _load_sms_config(self) -> None:
         cfg = get_sms_config()
         self.sms_enabled_cb.setChecked(cfg.enabled)
@@ -181,8 +200,12 @@ class SettingsPanel(QWidget):
 
     def _save_proxies(self) -> None:
         text = self.proxy_edit.toPlainText()
+        save_proxy_text(text)
         count = self.proxy_pool.load_from_text(text)
         self.proxy_count_label.setText(f"当前可用代理: {self.proxy_pool.count} (新增 {count})")
+
+    def _save_auto_pay(self) -> None:
+        save_auto_pay(self.auto_pay_cb.isChecked())
 
     def is_auto_pay(self) -> bool:
         return self.auto_pay_cb.isChecked()

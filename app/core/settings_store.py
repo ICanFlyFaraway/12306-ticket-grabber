@@ -66,3 +66,19 @@ def save_sms_config(cfg: SmsConfig) -> None:
         set_setting("sms_access_key_secret", encrypt_password(cfg.access_key_secret))
     set_setting("sms_sign_name", cfg.sign_name.strip())
     set_setting("sms_template_code", cfg.template_code.strip())
+
+
+def get_proxy_text() -> str:
+    return get_setting("proxy_list", "")
+
+
+def save_proxy_text(text: str) -> None:
+    set_setting("proxy_list", text)
+
+
+def get_auto_pay() -> bool:
+    return get_setting("auto_pay", "0") == "1"
+
+
+def save_auto_pay(enabled: bool) -> None:
+    set_setting("auto_pay", "1" if enabled else "0")

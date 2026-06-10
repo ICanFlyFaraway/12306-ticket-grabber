@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -29,6 +31,7 @@ from app.ui.widgets.history_panel import HistoryPanel
 from app.ui.widgets.login_panel import LoginPanel
 from app.ui.widgets.monitor_panel import MonitorPanel
 from app.ui.widgets.settings_panel import SettingsPanel
+from app.ui.widgets.ticket_success_dialog import TicketSuccessDialog
 
 
 class MainWindow(QMainWindow):
@@ -75,6 +78,7 @@ class MainWindow(QMainWindow):
         self.monitor_panel = MonitorPanel(self.monitor)
         self.history_panel = HistoryPanel()
         self.settings_panel = SettingsPanel(self.proxy_pool)
+        self._tabs = tabs
 
         tabs.addTab(wrap_scroll_area(self.config_panel), "行程配置")
         tabs.addTab(wrap_scroll_area(self.login_panel), "登录")
@@ -86,7 +90,10 @@ class MainWindow(QMainWindow):
         self.config_panel.saved.connect(lambda _: self.statusBar().showMessage("配置已保存", 3000))
         self.login_panel.login_success.connect(self._on_login_success)
         self.monitor_panel.start_requested.connect(self._start_grabbing)
-        self.monitor_panel.order_created.connect(self._on_order_created)
+        self.monitor_panel.order_created.connect(
+            self._on_order_created,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     def _setup_status(self) -> None:
         sb = QStatusBar()
@@ -119,11 +126,32 @@ class MainWindow(QMainWindow):
 
     def _on_order_created(self, order_id: str, ticket, meta: dict | None = None) -> None:
         auto_pay = self.settings_panel.is_auto_pay()
-        self.payment_watcher.watch(order_id, auto_pay=auto_pay)
         self.history_panel.refresh()
         meta = meta or {}
-        travel_date = meta.get("travel_date", "") or getattr(ticket, "travel_date", "") or self.config_panel.get_primary_travel_date()
+        travel_date = (
+            meta.get("travel_date", "")
+            or getattr(ticket, "travel_date", "")
+            or self.config_panel.get_primary_travel_date()
+        )
         seat_type = meta.get("seat_type", "")
+
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if QApplication.instance():
+            QApplication.alert(self, 0)
+
+        tabs = self._tabs
+        if tabs:
+            tabs.setCurrentIndex(2)
+
+        TicketSuccessDialog.show_blocking(
+            self, order_id, ticket, seat_type, travel_date
+        )
+
+        self.payment_watcher.watch(order_id, auto_pay=auto_pay, show_notify=False)
+        self.statusBar().showMessage(f"抢票成功，订单 {order_id} 待支付", 15000)
+
         if ticket:
             self.calendar.add_trip(
                 ticket.train_code,
@@ -133,11 +161,7 @@ class MainWindow(QMainWindow):
                 ticket.start_time,
                 ticket.arrive_time,
             )
-        QMessageBox.information(
-            self,
-            "下单成功",
-            f"订单号: {order_id}\n请在 30 分钟内完成支付",
-        )
+
         if self.settings_panel.is_sms_enabled():
             self._sms_worker = SmsSendWorker(order_id, ticket, seat_type, travel_date)
             self._sms_worker.finished.connect(self._on_sms_sent)

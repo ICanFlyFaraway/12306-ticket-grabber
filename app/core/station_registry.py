@@ -99,7 +99,11 @@ def seed_stations_if_empty() -> int:
     if rows:
         with get_session() as session:
             return _save_rows_to_db(session, rows)
-    return 0
+    try:
+        count, _ = refresh_stations_from_remote()
+        return count
+    except Exception:
+        return 0
 
 
 def fetch_remote_station_rows() -> list[dict[str, str]]:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
@@ -22,6 +24,9 @@ from app.core.ticket_monitor import MonitorConfig, MonitorEvent, MonitorState, T
 class MonitorBridge(QObject):
     event_received = pyqtSignal(object)
 
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+
 
 class MonitorPanel(QWidget):
     order_created = pyqtSignal(str, object, dict)
@@ -30,7 +35,7 @@ class MonitorPanel(QWidget):
     def __init__(self, monitor: TicketMonitor, parent=None) -> None:
         super().__init__(parent)
         self.monitor = monitor
-        self._bridge = MonitorBridge()
+        self._bridge = MonitorBridge(self)
         self._bridge.event_received.connect(self._handle_event)
         self.monitor.on_event = self._bridge.event_received.emit
         self._build_ui()
@@ -107,7 +112,7 @@ class MonitorPanel(QWidget):
         self.monitor.stop()
 
     def _handle_event(self, event: MonitorEvent) -> None:
-        self.log_view.append(f"[{event.type}] {event.message}")
+        self.log_view.append(self._format_log(event.message, event.type))
         self.state_label.setText(f"状态: {self.monitor.state.value}")
 
         if event.ticket:
@@ -147,4 +152,11 @@ class MonitorPanel(QWidget):
             self.ticket_table.setItem(row, col, item)
 
     def _append_log(self, msg: str) -> None:
-        self.log_view.append(msg)
+        self.log_view.append(self._format_log(msg))
+
+    @staticmethod
+    def _format_log(msg: str, event_type: str | None = None) -> str:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if event_type:
+            return f"[{ts}] [{event_type}] {msg}"
+        return f"[{ts}] {msg}"

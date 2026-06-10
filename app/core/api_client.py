@@ -66,7 +66,9 @@ class ApiClient:
             return
         resp = self.get(f"{KYFW_BASE}/otn/leftTicket/init")
         self._query_path = self._parse_query_path(resp.text)
-        self.get(f"{PASSPORT_BASE}/passport/web/login")
+        self.get(f"{KYFW_BASE}/otn/login/init")
+        self.get(f"{KYFW_BASE}/otn/resources/login.html")
+        self.post(f"{KYFW_BASE}/passport/web/auth/uamtk-static", data={"appid": "otn"})
 
     def resolve_station_code(self, name: str, local_map: dict[str, str] | None = None) -> str:
         """将站名解析为电报码，使用本地 + 12306 全量站名表。"""
@@ -206,15 +208,20 @@ class ApiClient:
             return None
         from_code = parts[6]
         to_code = parts[7]
+        start_time = parts[8]
+        arrive_time = parts[9]
+        duration = parts[10]
+        if not is_valid_train_schedule(start_time, arrive_time, duration):
+            return None
         return TrainTicket(
             train_code=parts[3],
             from_station=from_code,
             to_station=to_code,
             from_station_name=station_map.get(from_code, from_code),
             to_station_name=station_map.get(to_code, to_code),
-            start_time=parts[8],
-            arrive_time=parts[9],
-            duration=parts[10],
+            start_time=start_time,
+            arrive_time=arrive_time,
+            duration=duration,
             can_web_buy=parts[11],
             secret_str=parts[0] if parts[0] else parts[2],
             travel_date=travel_date,
@@ -268,16 +275,102 @@ class ApiClient:
             )
         return result
 
+    def _set_uamtk_cookie(self, uamtk: str) -> None:
+        if not uamtk:
+            return
+        self.session.cookies.update({"uamtk": uamtk})
+
+    def complete_login(self, uamtk: str | None = None, qr_login: bool = False) -> tuple[bool, str]:
+        """登录成功后换取 kyfw 侧 apptk，建立可校验的会话。"""
+        if USE_MOCK:
+            return self.logged_in, ""
+
+        login_headers = {
+            **DEFAULT_HEADERS,
+            "Referer": f"{KYFW_BASE}/otn/resources/login.html",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        client_headers = {
+            **login_headers,
+            "Referer": f"{KYFW_BASE}/otn/passport?redirect=/otn/login/userLogin",
+        }
+
+        if uamtk:
+            self._set_uamtk_cookie(uamtk)
+
+        # 密码登录才需要 userLogin 桥接；扫码登录 checkqr 成功后直接换票
+        if not qr_login:
+            self.post(
+                f"{KYFW_BASE}/otn/login/userLogin",
+                data={"_json_att": ""},
+                headers=login_headers,
+            )
+
+        resp = self.post(
+            f"{KYFW_BASE}/passport/web/auth/uamtk",
+            data={"appid": "otn"},
+            headers=login_headers,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            return False, "uamtk 响应解析失败"
+        if str(data.get("result_code", "")) != "0":
+            msg = data.get("result_message") or "uamtk 验证失败"
+            return False, str(msg)
+        apptk = data.get("newapptk") or data.get("apptk")
+        if not apptk:
+            return False, "未获取到 newapptk"
+
+        resp2 = self.post(
+            f"{KYFW_BASE}/otn/uamauthclient",
+            data={"tk": apptk},
+            headers=client_headers,
+        )
+        try:
+            result = resp2.json()
+        except Exception:
+            return False, "uamauthclient 响应解析失败"
+        if str(result.get("result_code", "")) != "0":
+            msg = result.get("result_message") or "客户端验证失败"
+            return False, str(msg)
+
+        username = result.get("username")
+        if username:
+            self.username = str(username)
+
+        self.post(f"{KYFW_BASE}/otn/login/conf", headers=login_headers)
+        return True, ""
+
+    def refresh_login_status(self) -> bool:
+        """尝试刷新登录态，用于检查登录前恢复会话。"""
+        if USE_MOCK:
+            return self.logged_in
+        if not self.logged_in:
+            return False
+        ok, _ = self.complete_login(qr_login=True)
+        if ok and self.check_user():
+            return True
+        ok, _ = self.complete_login(qr_login=False)
+        return ok and self.check_user()
+
     def check_user(self) -> bool:
         if USE_MOCK:
             return self.logged_in
         url = f"{KYFW_BASE}/otn/login/checkUser"
         resp = self.post(url, data={"_json_att": ""})
         try:
-            data = resp.json()
-            return data.get("data", {}).get("flag") is True
+            payload = resp.json()
         except Exception:
             return False
+        data = payload.get("data")
+        if isinstance(data, dict):
+            flag = data.get("flag")
+            if flag is True or flag in (1, "1", "Y", "y", "true"):
+                return True
+        if data is True or data == "1":
+            return True
+        return False
 
     def submit_order_request(
         self, secret_str: str, train_date: str, from_code: str, to_code: str
@@ -335,6 +428,20 @@ class ApiClient:
 
 def travel_date_fallback() -> str:
     return time.strftime("%Y-%m-%d")
+
+
+def is_valid_train_schedule(start_time: str, arrive_time: str, duration: str) -> bool:
+    """12306 对停运/不可售车次会用 24:00 与 99:59 作为占位。"""
+    if not start_time or not arrive_time:
+        return False
+    if start_time == "24:00" or arrive_time == "24:00":
+        return False
+    if duration == "99:59" or duration.startswith("99:"):
+        return False
+    time_pattern = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+    if not time_pattern.match(start_time) or not time_pattern.match(arrive_time):
+        return False
+    return True
 
 
 def has_ticket(seat_status: str) -> bool:

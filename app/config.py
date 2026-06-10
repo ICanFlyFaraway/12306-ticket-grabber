@@ -13,9 +13,9 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "ticket_grabber.db"
 STATIONS_PATH = DATA_DIR / "stations.json"
 
-# 12306 官方接口
+# 12306 官方接口（登录/扫码/令牌交换须统一走 kyfw，否则 cookie 无法共享）
 KYFW_BASE = "https://kyfw.12306.cn"
-PASSPORT_BASE = "https://passport.12306.cn"
+PASSPORT_BASE = KYFW_BASE
 
 DEFAULT_HEADERS = {
     "User-Agent": (

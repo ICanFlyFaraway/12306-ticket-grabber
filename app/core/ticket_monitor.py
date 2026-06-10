@@ -119,6 +119,12 @@ class TicketMonitor:
                             data={"seat_type": seat_type, "travel_date": date_hint},
                         )
                         if cfg.auto_submit:
+                            self._emit(
+                                "submitting",
+                                f"尝试下单 {date_hint} {ticket.train_code} {seat_type}",
+                                ticket=ticket,
+                                data={"seat_type": seat_type, "travel_date": date_hint},
+                            )
                             result = self._submit(ticket, seat_type, cfg)
                             if result.success:
                                 self.state = MonitorState.SUCCESS

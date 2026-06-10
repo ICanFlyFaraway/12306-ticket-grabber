@@ -9,11 +9,9 @@ __pycache__/
 dist/
 build/
 
-# 本地数据与密钥（勿上传）
-data/ticket_grabber.db
-data/.key
-data/trips.ics
-data/stations_full.json
+# 本地运行时数据（SQLite、密钥、缓存等，勿提交）
+data/*
+!data/.gitkeep
 
 # IDE
 .idea/

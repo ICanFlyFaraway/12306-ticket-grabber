@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
 
 from PyQt6.QtWidgets import QApplication
 
-from app.config import APP_NAME, USE_MOCK
+from app.config import APP_NAME, DB_PATH, USE_MOCK
 from app.core.station_registry import seed_stations_if_empty
 from app.database.db import init_db
 from app.ui.main_window import MainWindow
@@ -19,6 +19,7 @@ from app.ui.main_window import MainWindow
 def main() -> int:
     init_db()
     seed_stations_if_empty()
+    print(f"本地数据已写入: {DB_PATH}")
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     if USE_MOCK:
