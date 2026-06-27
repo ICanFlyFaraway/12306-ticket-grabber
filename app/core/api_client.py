@@ -4,13 +4,14 @@ import json
 import random
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
 
-from app.config import DEFAULT_HEADERS, KYFW_BASE, PASSPORT_BASE, USE_MOCK
+from app.config import DEFAULT_HEADERS, KYFW_BASE, PASSPORT_BASE, SEAT_TYPES, USE_MOCK
 from app.core.proxy_pool import ProxyPool
 from app.core.station_registry import resolve_station_code as lookup_station_code
 
@@ -372,37 +373,325 @@ class ApiClient:
             return True
         return False
 
+    @staticmethod
+    def normalize_station_name(name: str) -> str:
+        name = (name or "").strip()
+        if name.endswith("站") and len(name) > 1:
+            return name[:-1]
+        return name
+
+    @staticmethod
+    def decode_secret_str(secret_str: str) -> str:
+        decoded = (secret_str or "").strip()
+        if not decoded:
+            return ""
+        for _ in range(3):
+            next_value = urllib.parse.unquote(decoded)
+            if next_value == decoded:
+                break
+            decoded = next_value
+        return decoded
+
+    def back_train_date(self) -> str:
+        cookie_date = self.session.cookies.get("_jc_save_toDate")
+        return cookie_date or travel_date_fallback()
+
+    def prepare_order_session(self) -> bool:
+        if USE_MOCK:
+            return self.logged_in
+        self.get(f"{KYFW_BASE}/otn/leftTicket/init")
+        if self.check_user():
+            return True
+        return self.refresh_login_status()
+
+    @staticmethod
+    def _is_true(value: Any) -> bool:
+        if value is True:
+            return True
+        if value is False or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return value == 1
+        return str(value).lower() in ("true", "1", "y", "yes")
+
+    def parse_submit_order_response(self, resp: dict[str, Any]) -> tuple[bool, str]:
+        if not self._is_true(resp.get("status")):
+            return False, self._api_error(resp, "预提交失败")
+
+        data = resp.get("data")
+        if data == "N":
+            return True, ""
+        if isinstance(data, dict):
+            if self._is_true(data.get("submitStatus")):
+                return True, ""
+            err = data.get("errMsg") or data.get("msg") or data.get("message")
+            if err:
+                return False, str(err)
+        return False, self._api_error(resp, "预提交失败")
+
+    def find_fresh_ticket(
+        self,
+        from_code: str,
+        to_code: str,
+        travel_date: str,
+        train_code: str,
+    ) -> TrainTicket | None:
+        tickets = self.query_tickets(from_code, to_code, travel_date, force_real=True)
+        for ticket in tickets:
+            if ticket.train_code == train_code:
+                return ticket
+        return None
+
     def submit_order_request(
-        self, secret_str: str, train_date: str, from_code: str, to_code: str
+        self,
+        secret_str: str,
+        train_date: str,
+        from_name: str,
+        to_name: str,
     ) -> dict[str, Any]:
         if USE_MOCK:
             time.sleep(0.3)
             if random.random() < 0.85:
-                return {"status": True, "order_id": f"MOCK{int(time.time())}"}
-            return {"status": False, "message": "模拟下单失败，余票已被抢"}
+                return {"status": True, "data": "N", "order_id": f"MOCK{int(time.time())}"}
+            return {"status": False, "messages": ["模拟下单失败，余票已被抢"]}
 
-        url = f"{KYFW_BASE}/otn/leftTicket/submitOrderRequest"
+        if not self.check_user() and not self.refresh_login_status():
+            return {"status": False, "messages": ["登录已失效，请重新登录"]}
+
+        decoded_secret = self.decode_secret_str(secret_str)
+        if not decoded_secret:
+            return {"status": False, "messages": ["车票信息无效，请重新查票"]}
+
+        from_name = self.normalize_station_name(from_name)
+        to_name = self.normalize_station_name(to_name)
+        if not from_name or not to_name:
+            return {"status": False, "messages": ["出发站或到达站无效"]}
+
+        headers = {
+            **DEFAULT_HEADERS,
+            "Referer": f"{KYFW_BASE}/otn/leftTicket/init",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
         data = {
-            "secretStr": secret_str,
+            "secretStr": decoded_secret,
             "train_date": train_date,
-            "back_train_date": travel_date_fallback(),
+            "back_train_date": self.back_train_date(),
             "tour_flag": "dc",
             "purpose_codes": "ADULT",
-            "query_from_station_name": from_code,
-            "query_to_station_name": to_code,
+            "query_from_station_name": from_name,
+            "query_to_station_name": to_name,
             "undefined": "",
         }
-        resp = self.post(url, data=data)
-        return resp.json()
+        resp = self.post(url=f"{KYFW_BASE}/otn/leftTicket/submitOrderRequest", data=data, headers=headers)
+        try:
+            payload = resp.json()
+        except Exception:
+            snippet = resp.text[:120].strip()
+            if snippet.startswith("<"):
+                return {"status": False, "messages": ["预提交返回异常页面，请重新登录"]}
+            return {"status": False, "messages": ["预提交响应解析失败"]}
+        if not isinstance(payload, dict):
+            return {"status": False, "messages": ["预提交响应格式异常"]}
+        return payload
+
+    def _confirm_headers(self, referer: str | None = None) -> dict[str, str]:
+        return {
+            **DEFAULT_HEADERS,
+            "Referer": referer or f"{KYFW_BASE}/otn/confirmPassenger/initDc",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+
+    def _parse_init_dc(self, html: str) -> tuple[str, dict[str, Any]]:
+        token_match = re.search(r"globalRepeatSubmitToken\s*=\s*'([^']*)'", html)
+        if not token_match:
+            raise ValueError("无法获取订单提交令牌，请重新登录")
+        idx = html.find("ticketInfoForPassengerForm")
+        if idx < 0:
+            raise ValueError("无法解析订单页面，请重新查票")
+        start = html.find("{", idx)
+        depth = 0
+        end = start
+        for pos, ch in enumerate(html[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = pos + 1
+                    break
+        form_text = html[start:end].replace("'", '"')
+        form = json.loads(form_text)
+        return token_match.group(1), form
+
+    @staticmethod
+    def _build_passenger_strings(passengers: list[dict], seat_code: str) -> tuple[str, str]:
+        ticket_parts: list[str] = []
+        old_parts: list[str] = []
+        for index, passenger in enumerate(passengers, 1):
+            name = passenger["name"]
+            id_no = passenger["id_no"]
+            id_type = passenger.get("id_type", "1")
+            phone = passenger.get("phone", "")
+            ticket_parts.append(f"{seat_code},0,{index},{name},1,{id_type},{id_no},{phone},N")
+            old_parts.append(f"{name},1,{id_no},1")
+        return "_".join(ticket_parts), "_".join(old_parts) + "_"
+
+    @staticmethod
+    def _api_error(payload: dict[str, Any], default: str) -> str:
+        messages = payload.get("messages")
+        if isinstance(messages, list) and messages:
+            return str(messages[0])
+        if isinstance(messages, str) and messages:
+            return messages
+        validate = payload.get("validateMessages") or {}
+        if isinstance(validate, dict):
+            for value in validate.values():
+                if value:
+                    return str(value)
+        data = payload.get("data")
+        if isinstance(data, dict) and data.get("errMsg"):
+            return str(data["errMsg"])
+        return default
+
+    def complete_booking(
+        self,
+        passengers: list[dict],
+        seat_type: str,
+        train_code: str,
+    ) -> tuple[bool, str, str]:
+        if USE_MOCK:
+            return True, "下单成功", f"MOCK{int(time.time())}"
+
+        seat_code = SEAT_TYPES.get(seat_type, "O")
+        passenger_ticket, old_passenger = self._build_passenger_strings(passengers, seat_code)
+
+        init_url = f"{KYFW_BASE}/otn/confirmPassenger/initDc"
+        init_resp = self.get(
+            init_url,
+            params={"_json_att": "", "type": "1", "random": str(int(time.time() * 1000))},
+            headers=self._confirm_headers(f"{KYFW_BASE}/otn/leftTicket/init"),
+        )
+        token, form = self._parse_init_dc(init_resp.text)
+        query = form.get("queryLeftTicketRequestDTO") or {}
+        key_check = form.get("key_check_isChange", "")
+        left_ticket = form.get("leftTicketStr", "")
+        train_location = form.get("train_location", "")
+        confirm_headers = self._confirm_headers()
+
+        check_data = {
+            "cancel_flag": "3",
+            "bed_level_order_num": "0",
+            "passengerTicketStr": passenger_ticket,
+            "oldPassengerStr": old_passenger,
+            "tour_flag": "dc",
+            "whatsSelect": "1",
+            "seatDetailType": "000",
+            "roomType": "00",
+            "dwAll": "N",
+            "_json_att": "",
+            "REPEAT_SUBMIT_TOKEN": token,
+        }
+        check_resp = self.post(
+            f"{KYFW_BASE}/otn/confirmPassenger/checkOrderInfo",
+            data=check_data,
+            headers=confirm_headers,
+        ).json()
+        if not check_resp.get("status"):
+            return False, self._api_error(check_resp, "订单核验失败"), ""
+
+        self.post(
+            f"{KYFW_BASE}/otn/confirmPassenger/getPassengerDTOs",
+            data={"_json_att": "", "REPEAT_SUBMIT_TOKEN": token},
+            headers=confirm_headers,
+        )
+
+        confirm_data = {
+            "passengerTicketStr": passenger_ticket,
+            "oldPassengerStr": old_passenger,
+            "randCode": "",
+            "purpose_codes": "00",
+            "key_check_isChange": key_check,
+            "leftTicketStr": left_ticket,
+            "train_location": train_location,
+            "choose_seats": "",
+            "seatDetailType": "000",
+            "whatsSelect": "1",
+            "roomType": "00",
+            "dwAll": "N",
+            "_json_att": "",
+            "REPEAT_SUBMIT_TOKEN": token,
+        }
+        confirm_resp = self.post(
+            f"{KYFW_BASE}/otn/confirmPassenger/confirmPassengerInfoSingle",
+            data=confirm_data,
+            headers=confirm_headers,
+        ).json()
+        if not confirm_resp.get("status"):
+            return False, self._api_error(confirm_resp, "确认乘客信息失败"), ""
+
+        queue_data = {
+            "train_date": query.get("train_date", ""),
+            "train_no": query.get("station_train_code", train_code),
+            "stationTrainCode": query.get("station_train_code", train_code),
+            "seatType": seat_code,
+            "fromStationTelecode": query.get("from_station", ""),
+            "toStationTelecode": query.get("to_station", ""),
+            "leftTicket": left_ticket,
+            "purpose_codes": "00",
+            "train_location": train_location,
+            "_json_att": "",
+            "REPEAT_SUBMIT_TOKEN": token,
+        }
+        queue_resp = self.post(
+            f"{KYFW_BASE}/otn/confirmPassenger/getQueueCount",
+            data=queue_data,
+            headers=confirm_headers,
+        ).json()
+        if not queue_resp.get("status"):
+            return False, self._api_error(queue_resp, "排队查询失败"), ""
+
+        queue_confirm_data = {
+            **queue_data,
+            "passengerTicketStr": passenger_ticket,
+            "oldPassengerStr": old_passenger,
+            "key_check_isChange": key_check,
+        }
+        queue_confirm_resp = self.post(
+            f"{KYFW_BASE}/otn/confirmPassenger/confirmSingleForQueue",
+            data=queue_confirm_data,
+            headers=confirm_headers,
+        ).json()
+        if not queue_confirm_resp.get("status"):
+            return False, self._api_error(queue_confirm_resp, "进入排队失败"), ""
+
+        for _ in range(30):
+            wait_resp = self.get(
+                f"{KYFW_BASE}/otn/confirmPassenger/queryOrderWaitTime",
+                params={
+                    "random": str(int(time.time() * 1000)),
+                    "tourFlag": "dc",
+                    "_json_att": "",
+                },
+                headers=confirm_headers,
+            ).json()
+            data = wait_resp.get("data") or {}
+            order_id = data.get("orderId") or ""
+            if wait_resp.get("status") and order_id:
+                return True, "下单成功", str(order_id)
+            msg = str(data.get("msg") or "")
+            if msg and any(word in msg for word in ("失败", "错误", "取消")):
+                return False, msg, ""
+            time.sleep(1)
+
+        return False, "排队确认超时，请到 12306 我的订单查看是否生单", ""
 
     def confirm_passenger_info(
         self, passengers: list[dict], seat_type: str, train_code: str
     ) -> dict[str, Any]:
         if USE_MOCK:
             return {"status": True, "ticket_price": "553.5"}
-
-        # 真实环境需多步确认；此处保留接口骨架
-        return {"status": True, "ticket_price": ""}
+        ok, _, _ = self.complete_booking(passengers, seat_type, train_code)
+        return {"status": ok, "ticket_price": ""}
 
     def query_order_status(self, order_id: str) -> str:
         if USE_MOCK:

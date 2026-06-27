@@ -136,7 +136,7 @@ class ConfigPanel(QWidget):
         date_row = QHBoxLayout()
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
-        self.date_edit.setDate(QDate.currentDate().addDays(1))
+        self.date_edit.setDate(QDate.currentDate())
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         add_date_btn = QPushButton("添加日期")
         add_date_btn.clicked.connect(self._add_date)
@@ -297,9 +297,11 @@ class ConfigPanel(QWidget):
         QMessageBox.critical(self, "站名更新失败", message)
 
     def _add_default_date(self) -> None:
-        self.date_edit.setMinimumDate(QDate.currentDate())
-        self.date_edit.setMaximumDate(QDate.currentDate().addDays(15))
-        default = self.date_edit.date().toString("yyyy-MM-dd")
+        today = QDate.currentDate()
+        self.date_edit.setMinimumDate(today)
+        self.date_edit.setMaximumDate(today.addDays(15))
+        self.date_edit.setDate(today)
+        default = today.toString("yyyy-MM-dd")
         self.date_list.clear()
         self.date_list.addItem(default)
 

@@ -178,6 +178,8 @@ class TicketMonitor:
             seat_type=seat_type,
             travel_date=travel_date,
             passenger_ids=cfg.passenger_ids,
+            from_name=cfg.from_name,
+            to_name=cfg.to_name,
         )
 
     def _emit(

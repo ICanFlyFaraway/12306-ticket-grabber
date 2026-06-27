@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from app.config import SEAT_TYPES, USE_MOCK
+from app.config import USE_MOCK
 from app.core.api_client import ApiClient, TrainTicket
 from app.database.db import get_session
 from app.database.models import OrderRecord, Passenger
@@ -27,6 +27,8 @@ class OrderService:
         seat_type: str,
         travel_date: str,
         passenger_ids: list[int],
+        from_name: str = "",
+        to_name: str = "",
     ) -> OrderSubmitResult:
         if not self.client.logged_in:
             return OrderSubmitResult(False, "请先登录")
@@ -35,38 +37,59 @@ class OrderService:
         if not passengers:
             return OrderSubmitResult(False, "请配置乘车人")
 
+        from_station = ApiClient.normalize_station_name(
+            from_name or ticket.from_station_name or ticket.from_station
+        )
+        to_station = ApiClient.normalize_station_name(
+            to_name or ticket.to_station_name or ticket.to_station
+        )
+
         try:
+            if not self.client.prepare_order_session():
+                return OrderSubmitResult(False, "登录已失效，请重新登录")
+
+            fresh_ticket = self.client.find_fresh_ticket(
+                ticket.from_station,
+                ticket.to_station,
+                travel_date,
+                ticket.train_code,
+            )
+            if fresh_ticket:
+                ticket = fresh_ticket
+
             resp = self.client.submit_order_request(
                 secret_str=ticket.secret_str,
                 train_date=travel_date,
-                from_code=ticket.from_station_name or ticket.from_station,
-                to_code=ticket.to_station_name or ticket.to_station,
+                from_name=from_station,
+                to_name=to_station,
             )
             if USE_MOCK:
                 if resp.get("status"):
-                    order_id = resp["order_id"]
+                    order_id = resp.get("order_id", f"MOCK{int(datetime.now().timestamp())}")
                     self._save_order(ticket, seat_type, travel_date, passengers, order_id)
                     return OrderSubmitResult(
                         True, "下单成功，请在30分钟内完成支付", order_id, "553.5"
                     )
                 return OrderSubmitResult(False, resp.get("message", "下单失败"))
 
-            if resp.get("status") is True or resp.get("data") == "N":
-                order_id = resp.get("data", {}).get("orderId", "")
-                self._save_order(ticket, seat_type, travel_date, passengers, order_id)
-                confirm = self.client.confirm_passenger_info(
-                    passengers, SEAT_TYPES.get(seat_type, "O"), ticket.train_code
-                )
-                price = confirm.get("ticket_price", "")
-                return OrderSubmitResult(True, "订单提交成功", order_id, price)
-            msg = resp.get("messages", ["下单失败"])
-            return OrderSubmitResult(False, msg[0] if msg else "下单失败")
+            ok, message = self.client.parse_submit_order_response(resp)
+            if not ok:
+                return OrderSubmitResult(False, message)
+
+            ok, message, order_id = self.client.complete_booking(
+                passengers, seat_type, ticket.train_code
+            )
+            if not ok:
+                return OrderSubmitResult(False, message)
+
+            self._save_order(ticket, seat_type, travel_date, passengers, order_id)
+            return OrderSubmitResult(True, message or "订单提交成功", order_id, "")
         except Exception as exc:
             return OrderSubmitResult(False, f"下单异常: {exc}")
 
     def _load_passengers(self, passenger_ids: list[int]) -> list[dict]:
         if not passenger_ids:
-            return [{"name": "测试乘客", "id_no": "110101199001011234", "id_type": "1"}]
+            return []
         with get_session() as session:
             rows = (
                 session.query(Passenger)
@@ -79,6 +102,7 @@ class OrderService:
                     "id_no": p.id_no,
                     "id_type": p.id_type,
                     "passenger_type": p.passenger_type,
+                    "phone": p.phone,
                 }
                 for p in rows
             ]
